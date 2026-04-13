@@ -1,4 +1,4 @@
-name: Deploy to EC2 via ECR (OIDC)
+name: Deploy to EC2 via ECR (OIDC + SSM)
 
 on:
   push:
@@ -20,49 +20,78 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+    # 1️⃣ Checkout Code
     - name: Checkout Code
       uses: actions/checkout@v3
 
+    # 2️⃣ Configure AWS via OIDC
     - name: Configure AWS Credentials (OIDC)
       uses: aws-actions/configure-aws-credentials@v2
       with:
         role-to-assume: arn:aws:iam::860366539080:role/githubeksdeploy
         aws-region: ${{ env.AWS_REGION }}
 
+    # 3️⃣ Debug Identity (IMPORTANT)
+    - name: Debug AWS Identity
+      run: aws sts get-caller-identity
+
+    # 4️⃣ Login to ECR
     - name: Login to ECR
       run: |
         aws ecr get-login-password --region $AWS_REGION \
         | docker login --username AWS --password-stdin \
         $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
 
+    # 5️⃣ Build Docker Image
     - name: Build Docker Image
       run: |
         docker build -t $ECR_REPOSITORY .
 
+    # 6️⃣ Tag Image
     - name: Tag Image
       run: |
         docker tag $ECR_REPOSITORY:latest \
         $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest
 
+    # 7️⃣ Push to ECR
     - name: Push to ECR
       run: |
         docker push $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest
 
-    - name: Deploy on EC2
-      uses: appleboy/ssh-action@v0.1.10
-      with:
-        host: ${{ env.EC2_HOST }}
-        username: ubuntu
-        key: ${{ secrets.EC2_SSH_KEY }}
-        script: |
-          aws ecr get-login-password --region $AWS_REGION \
-          | docker login --username AWS --password-stdin \
-          $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+    # 8️⃣ Deploy using SSM (NO SSH)
+    - name: Deploy on EC2 via SSM
+      run: |
+        echo "Fetching Instance ID from IP..."
+        INSTANCE_ID=$(aws ec2 describe-instances \
+          --filters "Name=ip-address,Values=${{ env.EC2_HOST }}" \
+          --query "Reservations[].Instances[].InstanceId" \
+          --output text)
 
-          docker stop devops-app || true
-          docker rm devops-app || true
+        echo "Instance ID: $INSTANCE_ID"
 
-          docker pull $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest
+        echo "Sending deployment command via SSM..."
 
-          docker run -d -p 3000:3000 --name devops-app \
-          $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest
+        COMMAND_ID=$(aws ssm send-command \
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --comment "Deploy Docker Container" \
+          --parameters commands="[
+            \"aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com\",
+            \"docker stop devops-app || true\",
+            \"docker rm devops-app || true\",
+            \"docker pull $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest\",
+            \"docker run -d -p 3000:3000 --name devops-app $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest\"
+          ]" \
+          --region $AWS_REGION \
+          --query "Command.CommandId" \
+          --output text)
+
+        echo "SSM Command ID: $COMMAND_ID"
+
+        echo "Waiting for command execution..."
+
+        sleep 10
+
+        aws ssm list-command-invocations \
+          --command-id $COMMAND_ID \
+          --details
