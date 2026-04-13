@@ -7,7 +7,7 @@ on:
 
 env:
   AWS_REGION: ap-south-1
-  ECR_REPOSITORY: devops-app
+  ECR_REPOSITORY: bb-oidc-demo
   ACCOUNT_ID: 860366539080
   EC2_HOST: 43.204.22.111
 
